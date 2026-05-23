@@ -1,0 +1,15 @@
+Feature,Importance,Percentage
+flame_detected,0.32479692,32.48
+CH4,0.17077114,17.08
+smoke_concentration,0.16558518,16.56
+LPG × (1-humidity),0.10273989,10.27
+pressure_drop,0.08256212,8.26
+CO_concentration,0.068102494,6.81
+LPG,0.03811988,3.81
+temperature × smoke,0.017580193,1.76
+temperature,0.012753105,1.28
+CH4/CO ratio,0.0075792284,0.76
+motion × temperature,0.0072472813,0.72
+humidity,0.0011858102,0.12
+motion,0.00054552546,0.05
+light_anomaly,0.00043127095,0.04

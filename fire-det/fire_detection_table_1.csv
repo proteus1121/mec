@@ -1,0 +1,7 @@
+False Alarm Source,Optical Artifact,Threshold Mechanism,Pixels Filtered,Effectiveness
+"Dark regions (noise, shadows)",Low brightness pixels detected as fire,MIN_VALUE ≥ 180,903453,Dark pixels rejected at first stage
+Grayscale artifacts (reflections),Monochromatic pixels (neutral color),"δ = max(R,G,B) - min(R,G,B) > 0",8481,Grayscale pixels rejected (no color)
+Desaturated regions (pale colors),Low saturation mimicking fire-like hues,MIN_SATURATION ≥ 80,61182,Low saturation pixels eliminated
+Non-fire colored regions,"Hues outside flame range (0-50°, 162-180°)",RED_DOMINANCE ≥ 30,163335,Non-flame hues filtered out
+Transient optical artifacts,Single-frame anomalies without temporal consistency,Variance ≥ 5e-06,Temporal variance analysis,Requires variance > 5e-06 for confirmation
+Frame-level false positives,Single/few frames meeting fire criteria,CONFIRM_FRAMES = 3,~0 frames rejected,Requires ≥3 consecutive frame confirmations
