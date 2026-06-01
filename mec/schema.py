@@ -1059,11 +1059,11 @@ class MBENetApp(tk.Tk):
         """
         g = NetworkGraph()
 
-        tx  = g.add_node('plc_tx', 120,  280, Z=75,  name='PLC-TX')
+        tx  = g.add_node('plc_tx', 120,  280, Z=59,  name='PLC-TX')
         n1  = g.add_node('node',   320,  280,         name='Вузол-1')
         n2  = g.add_node('node',   520,  280,         name='Вузол-2')
-        rx  = g.add_node('plc_rx', 720,  280, Z=75,  name='PLC-RX')
-        ld1 = g.add_node('load',   320,  460, Z=75,  name='Навант-1')
+        rx  = g.add_node('plc_rx', 720,  280, Z=59,  name='PLC-RX')
+        ld1 = g.add_node('load',   320,  460, Z=10000000000,  name='Навант-1')
         ld2 = g.add_node('load',   520,  460, Z=150, name='Навант-2')
 
         g.add_edge(tx,  n1,  L=30, alpha=0.04, beta=0.18, Z0=150)

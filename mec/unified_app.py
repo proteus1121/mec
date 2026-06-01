@@ -536,8 +536,26 @@ class NetworkGraph:
                 q.append((nxt, nn, ne))
         return None, None
 
-    def compute_Zin(self, node_id, coming_edge_id):
-        """Рекурсивно обчислює вхідний опір на вузлі"""
+    def _get_gamma_z0(self, edge, freq_hz, cable_calc):
+        """Повертає (gamma, Z0) для ребра на заданій частоті.
+        Якщо ребро має cable_type — інтерполює зі спектру,
+        інакше використовує константи з ребра."""
+        ct = edge.get('cable_type')
+        mat = edge.get('material', 'copper')
+        if ct and cable_calc is not None:
+            freq_mhz = freq_hz / 1e6
+            p = cable_calc.get_params_at_freq(ct, mat, freq_mhz)
+            if p:
+                # alpha в БД зберігається в дБ/км → переводимо в Нп/м
+                alpha_npm = p['alpha'] / 8.686 / 1000.0
+                beta_radm = p['beta'] / 1000.0  # рад/км → рад/м
+                z0 = p['Z0']
+                return complex(alpha_npm, beta_radm), z0
+        # Fallback: константи з ребра (alpha Нп/м, beta рад/м)
+        return complex(edge.get('alpha', 0.0), edge.get('beta', 0.0)), edge.get('Z0', 75.0)
+
+    def compute_Zin(self, node_id, coming_edge_id, freq_hz=1e6, cable_calc=None):
+        """Рекурсивно обчислює вхідний опір на вузлі (частотно-залежний)"""
         node = self.nodes[node_id]
         if node['type'] in ('load', 'plc_rx'):
             return complex(node['Z'])
@@ -548,9 +566,9 @@ class NetworkGraph:
         for eid in other:
             e   = self.edges[eid]
             nxt = self.other_end(eid, node_id)
-            Zn  = self.compute_Zin(nxt, eid)
-            g   = complex(e['alpha'], e['beta'])
-            Zi  = Zin_branch(e['Z0'], g, e['L'], Zn)
+            Zn  = self.compute_Zin(nxt, eid, freq_hz, cable_calc)
+            g, Z0b = self._get_gamma_z0(e, freq_hz, cable_calc)
+            Zi  = Zin_branch(Z0b, g, e['L'], Zn)
             # Запобігаємо діленню на нуль і NaN
             if np.isfinite(Zi) and abs(Zi) > 1e-300:
                 Y  += 1.0 / Zi
@@ -568,8 +586,9 @@ class NetworkGraph:
             return False, "Шлях від TX до RX не знайдено"
         return True, "OK"
 
-    def build_cascade(self, freq_arr):
-        """Будує ABCD-каскад по мережі"""
+    def build_cascade(self, freq_arr, cable_calc=None):
+        """Будує ABCD-каскад по мережі з урахуванням ветвлень (T та X типи).
+        cable_calc — екземпляр CableCalculator для частотно-залежних gamma/Z0."""
         tx = next(n for n, d in self.nodes.items() if d['type'] == 'plc_tx')
         rx = next(n for n, d in self.nodes.items() if d['type'] == 'plc_rx')
         Zs = complex(self.nodes[tx]['Z'])
@@ -577,18 +596,26 @@ class NetworkGraph:
 
         path_nodes, path_edges = self.find_path(tx, rx)
         peset = set(path_edges)
+        
+        # Збираємо всі ребра ветвлень для візуалізації
+        all_branch_edges = []
+        for k, eid in enumerate(path_edges):
+            cur = path_nodes[k + 1]
+            if k + 1 == len(path_nodes) - 1:
+                continue
+            brs = [e for e in self.adj[cur] if e not in peset]
+            all_branch_edges.extend(brs)
 
         N   = len(freq_arr)
         att = np.zeros(N)
         phi = np.zeros(N)
-        
-        # Ініціалізуємо калькулятор кабелів один раз
-        cable_calc = CableCalculator()
 
         for fi in range(N):
-            f = freq_arr[fi]
-
-            shunts = {}
+            f = freq_arr[fi]   # Гц
+            
+            # --- Ветвлення: перераховуємо Zvid_gal на поточній частоті ---
+            branch_impedances = {}  # node_idx -> list of Zvid_gal
+            
             for k, eid in enumerate(path_edges):
                 cur = path_nodes[k + 1]
                 if k + 1 == len(path_nodes) - 1:
@@ -596,76 +623,96 @@ class NetworkGraph:
                 brs = [e for e in self.adj[cur] if e not in peset]
                 if not brs:
                     continue
-                Y = 0j
+                
+                branch_impedances[k + 1] = []
                 for beid in brs:
                     be  = self.edges[beid]
                     nxt = self.other_end(beid, cur)
-                    Zn  = self.compute_Zin(nxt, beid)
-                    
-                    # Отримуємо параметри кабелю з інтерполяцією для поточної частоти (в МГц)
-                    f_mhz = f / 1e6
-                    if be.get('cable_type') and be.get('material'):
-                        params = cable_calc.get_params_at_freq(be['cable_type'], be['material'], f_mhz)
-                        alpha = params.get('alpha', be.get('alpha', 0.04))
-                        beta = params.get('beta', be.get('beta', 0.18))
-                        Z0 = params.get('Z0', be.get('Z0', 50))
-                    else:
-                        alpha = be.get('alpha', 0.04)
-                        beta = be.get('beta', 0.18)
-                        Z0 = be.get('Z0', 50)
-                    
-                    bg  = complex(alpha, beta)
-                    Zi  = Zin_branch(Z0, bg, be['L'], Zn)
-                    if np.isfinite(Zi) and abs(Zi) > 1e-300:
-                        Y  += 1.0 / Zi
-                shunts[k + 1] = (1.0 / Y) if abs(Y) > 1e-30 else 1e9 + 0j
+                    # Рекурсивно обчислюємо вхідний опір відгалуження на поточній f
+                    Zn  = self.compute_Zin(nxt, beid, f, cable_calc)
+                    g, Z0b = self._get_gamma_z0(be, f, cable_calc)
+                    Zvid_gal = Zin_branch(Z0b, g, be['L'], Zn)
+                    branch_impedances[k + 1].append(Zvid_gal)
 
+            # --- Основний шлях TX→RX ---
             M = np.eye(2, dtype=complex)
             for k, eid in enumerate(path_edges):
                 e = self.edges[eid]
-                f = freq_arr[fi]
-                
-                # Отримуємо параметри кабелю з інтерполяцією для поточної частоти (в МГц)
-                f_mhz = f / 1e6
-                if e.get('cable_type') and e.get('material'):
-                    params = cable_calc.get_params_at_freq(e['cable_type'], e['material'], f_mhz)
-                    alpha = params.get('alpha', e.get('alpha', 0.04))
-                    beta = params.get('beta', e.get('beta', 0.18))
-                    Z0 = params.get('Z0', e.get('Z0', 50))
-                else:
-                    alpha = e.get('alpha', 0.04)
-                    beta = e.get('beta', 0.18)
-                    Z0 = e.get('Z0', 50)
-                
-                g = complex(alpha, beta)
+                g, Z0 = self._get_gamma_z0(e, f, cable_calc)
                 M_line = abcd_line(g, Z0, e['L'])
-                # Перевіряємо валідність матриці перед множенням
+                
                 if np.all(np.isfinite(M_line)) and np.all(np.isfinite(M)):
                     try:
-                        # Пригнічуємо попередження про overflow/invalid під час множення
-                        # (результат буде перевірений після операції)
                         with np.errstate(over='ignore', invalid='ignore'):
-                            M_new = M @ M_line
-                        # Перевіряємо результат множення
-                        if np.all(np.isfinite(M_new)) and np.max(np.abs(M_new)) < 1e150:
-                            M = M_new
+                            M = M @ M_line
                     except (RuntimeWarning, OverflowError):
                         pass
-                if k + 1 in shunts:
-                    M_shunt = abcd_shunt(shunts[k + 1])
-                    if np.all(np.isfinite(M_shunt)) and np.all(np.isfinite(M)):
+                
+                # Матриця шунтового відгалуження після сегменту
+                if k + 1 in branch_impedances:
+                    branch_list = branch_impedances[k + 1]
+                    if len(branch_list) == 1:
+                        Zvid_gal = branch_list[0]
+                        if np.isfinite(Zvid_gal) and abs(Zvid_gal) > 1e-300:
+                            M_branch = np.array([
+                                [1.0 + 0j, 0.0 + 0j],
+                                [1.0 / Zvid_gal, 1.0 + 0j]
+                            ])
+                        else:
+                            M_branch = np.eye(2, dtype=complex)
+                    elif len(branch_list) >= 2:
+                        Zvid_sum = sum(branch_list)
+                        if np.isfinite(Zvid_sum) and abs(Zvid_sum) > 1e-300:
+                            M_branch = np.array([
+                                [1.0 + 0j, 0.0 + 0j],
+                                [1.0 / Zvid_sum, 1.0 + 0j]
+                            ])
+                        else:
+                            M_branch = np.eye(2, dtype=complex)
+                    else:
+                        M_branch = np.eye(2, dtype=complex)
+                    
+                    if np.all(np.isfinite(M_branch)) and np.all(np.isfinite(M)):
                         try:
-                            # Пригнічуємо попередження про overflow/invalid під час множення
                             with np.errstate(over='ignore', invalid='ignore'):
-                                M_new = M @ M_shunt
-                            # Перевіряємо результат множення
-                            if np.all(np.isfinite(M_new)) and np.max(np.abs(M_new)) < 1e150:
-                                M = M_new
+                                M = M @ M_branch
                         except (RuntimeWarning, OverflowError):
                             pass
-            H        = transfer_H(M, Zs, ZL)
-            absH     = max(abs(H), 1e-300)
-            # Запобігаємо NaN у логарифмі та куті
+            
+            # Перевіряємо валідність матриці M перед використанням
+            if not np.all(np.isfinite(M)):
+                att[fi]  = 0.0
+                phi[fi]  = 0.0
+                continue
+            
+            # Елементи ABCD матриці
+            A = M[0, 0]
+            B = M[0, 1]
+            C = M[1, 0]
+            D = M[1, 1]
+            
+            # Перевіряємо валідність всіх елементів перед множенням
+            if not (np.isfinite(A) and np.isfinite(B) and np.isfinite(C) and np.isfinite(D)):
+                att[fi]  = 0.0
+                phi[fi]  = 0.0
+                continue
+            
+            # Формула передавальної функції: H = 2·ZL / (A·ZL + B + C·Zs·ZL + D·Zs)
+            try:
+                with np.errstate(over='ignore', invalid='ignore'):
+                    term1 = A * ZL
+                    term2 = C * Zs * ZL
+                    term3 = D * Zs
+                    denom = term1 + B + term2 + term3
+                
+                if np.isfinite(denom) and abs(denom) > 1e-200:
+                    H = (2.0 * ZL) / denom
+                else:
+                    H = 1e-300 + 0j
+            except:
+                H = 1e-300 + 0j
+            
+            absH = max(abs(H), 1e-300)
             if np.isfinite(absH) and absH > 0:
                 att[fi]  = -20. * np.log10(absH)
                 phi[fi]  = np.angle(H)
@@ -673,7 +720,7 @@ class NetworkGraph:
                 att[fi]  = 0.0
                 phi[fi]  = 0.0
 
-        return att, phi, path_nodes, path_edges
+        return att, phi, path_nodes, path_edges, all_branch_edges
 
     def to_dict(self):
         return {'nodes': self.nodes, 'edges': self.edges,
@@ -1190,7 +1237,7 @@ class UnifiedMBEApp(tk.Tk):
         self.cable_calc = CableCalculator()
         self._plot_n = 0
         self._fmin   = tk.DoubleVar(value=1.0)
-        self._fmax   = tk.DoubleVar(value=30.0)
+        self._fmax   = tk.DoubleVar(value=1000.0)
         self._fpts   = tk.IntVar(value=500)
 
         self._build_styles()
@@ -1414,9 +1461,10 @@ class UnifiedMBEApp(tk.Tk):
                 self._fmin.get() * 1e6,
                 self._fmax.get() * 1e6,
                 max(10, int(self._fpts.get())))
-            att, phi, pnodes, pedges = self.graph.build_cascade(freq)
+            att, phi, pnodes, pedges, branch_edges = self.graph.build_cascade(freq, self.cable_calc)
             self._draw_plots(freq / 1e6, att, phi)
-            self.net_canvas.highlight_path(pnodes, pedges)
+            # Підсвічуємо основний шлях і ветвлення
+            self.net_canvas.highlight_path(pnodes, pedges + branch_edges)
 
             n_seg = len(pedges)
             n_br  = sum(1 for n, d in self.graph.nodes.items()
@@ -1508,37 +1556,26 @@ class UnifiedMBEApp(tk.Tk):
                 messagebox.showerror("Помилка", f"Не вдалося завантажити схему: {str(ex)}")
 
     def _load_example(self):
-        """Розгалужена мережа з кабелями ШВВП 2×1.5"""
+        """Приклад з картини: 3 вузли по 5 метрів, навантаження 59 Ом"""
         g = NetworkGraph()
 
-        tx  = g.add_node('plc_tx', 120,  280, Z=75,  name='PLC-TX')
-        n1  = g.add_node('node',   320,  280,         name='Вузол-1')
-        n2  = g.add_node('node',   520,  280,         name='Вузол-2')
-        rx  = g.add_node('plc_rx', 720,  280, Z=75,  name='PLC-RX')
-        ld1 = g.add_node('load',   320,  460, Z=75,  name='Навант-1')
-        ld2 = g.add_node('load',   520,  460, Z=150, name='Навант-2')
+        tx  = g.add_node('plc_tx', 120,  200, Z=59,  name='PLC-TX')
+        n1  = g.add_node('node',   320,  200,         name='Node')
+        ld  = g.add_node('load',   320,  380, Z=10000000000,  name='Load')
+        rx  = g.add_node('plc_rx', 520,  200, Z=59,  name='PLC-RX')
 
-        # Розраховуємо параметри для ШВВП 2×1.5
-        params1 = self.cable_calc.calculate_params_at_freq('ШВВП 2×1.5', 'copper', 24.0)
-        
-        if params1:
-            g.add_edge(tx,  n1,  L=30, alpha=params1['alpha'], beta=params1['beta'], 
-                      Z0=params1['Z0'], cable_type='ШВВП 2×1.5', material='copper', frequency_mhz=24.0)
-            g.add_edge(n1,  n2,  L=20, alpha=params1['alpha'], beta=params1['beta'], 
-                      Z0=params1['Z0'], cable_type='ШВВП 2×1.5', material='copper', frequency_mhz=24.0)
-            g.add_edge(n2,  rx,  L=25, alpha=params1['alpha'], beta=params1['beta'], 
-                      Z0=params1['Z0'], cable_type='ШВВП 2×1.5', material='copper', frequency_mhz=24.0)
-            g.add_edge(n1,  ld1, L=10, alpha=params1['alpha'], beta=params1['beta'], 
-                      Z0=params1['Z0'], cable_type='ШВВП 2×1.5', material='copper', frequency_mhz=24.0)
-            g.add_edge(n2,  ld2, L=15, alpha=params1['alpha'], beta=params1['beta'], 
-                      Z0=params1['Z0'], cable_type='ШВВП 2×1.5', material='copper', frequency_mhz=24.0)
-        else:
-            # Fallback на стандартні значення
-            g.add_edge(tx,  n1,  L=30, alpha=0.04, beta=0.18, Z0=150)
-            g.add_edge(n1,  n2,  L=20, alpha=0.04, beta=0.18, Z0=150)
-            g.add_edge(n2,  rx,  L=25, alpha=0.04, beta=0.18, Z0=150)
-            g.add_edge(n1,  ld1, L=10, alpha=0.06, beta=0.20, Z0=150)
-            g.add_edge(n2,  ld2, L=15, alpha=0.05, beta=0.19, Z0=150)
+        # Кабель ШВВП 2×1.5, мідь — gamma(f) і Z0(f) інтерполюються зі спектра
+        cable_type = 'ШВВП 2×1.5'
+        material   = 'copper'
+
+        # Переконуємося що спектр є в БД для всього діапазону розрахунку
+        self.cable_calc.calculate_params_spectrum(cable_type, material,
+                                                   freq_min_mhz=0.1, freq_max_mhz=1000.0,
+                                                   n_points=500)
+
+        g.add_edge(tx,  n1,  L=5, cable_type=cable_type, material=material)
+        g.add_edge(n1,  rx,  L=5, cable_type=cable_type, material=material)
+        g.add_edge(n1,  ld,  L=5, cable_type=cable_type, material=material)
 
         self.graph = g
         self.net_canvas.graph    = g
@@ -1549,7 +1586,7 @@ class UnifiedMBEApp(tk.Tk):
         self.net_canvas.redraw()
         self._set_mode('select')
         self._status.configure(
-            text="Приклад завантажено (ШВВП 2×1.5)  —  натисніть ▶ РОЗРАХУВАТИ", fg=GRN)
+            text="Приклад завантажено (3 вузли × 5м, навант. 59 Ом, ШВВП 2×1.5)  —  натисніть ▶ РОЗРАХУВАТИ", fg=GRN)
 
 
 if __name__ == '__main__':
