@@ -33,7 +33,7 @@ ACC     = '#58A6FF'
 GRN     = '#3FB950'
 RED     = '#F78166'
 TEXT    = '#C9D1D9'
-DIM     = '#8B949E'
+DIM     = "#FFFFFF"
 ENTRY   = '#21262D'
 BTN     = '#238636'
 HDR     = '#1F2937'
@@ -678,6 +678,17 @@ class CableSettingsWindow(tk.Toplevel):
         rl['Z1re'].config( text=f"{d['Z1re'][i_idx]:.3f}")
         rl['phi1'].config( text=f"{d['phi1'][i_idx]:.4f}")
 
+        # ── Переміщуємо маркери на графіках ──────────────────────────────
+        if getattr(self, '_i_markers', None) and self._cv_cable is not None:
+            f_mhz_i = d['freq_hz'][i_idx] / 1e6
+            for mkr, annot, key in zip(self._i_markers, self._i_annots, ('alpha', 'beta', 'Z1re')):
+                y_val = float(d[key][i_idx])
+                mkr.set_xdata([f_mhz_i])
+                mkr.set_ydata([y_val])
+                annot.xy = (f_mhz_i, y_val)          # куди вказує стрілка
+                annot.set_text(f'{y_val:.4f}')        # актуальне значення
+            self._cv_cable.draw_idle()
+
     def _enable_i_slider(self, n_samples: int):
         """Вмикає слайдер і встановлює правильний діапазон після розрахунку."""
         self._i_slider.config(to=max(1, n_samples))
@@ -761,6 +772,8 @@ class CableSettingsWindow(tk.Toplevel):
             ('313', z0,    'Re(Z1), Ом',    'Re(Z1)(f) — Хвильовий опір',     '#3FB950'),
         ]
 
+        self._i_markers = []   # рухомі маркери на графіках (по одному на subplot)
+        self._i_annots  = []   # текстові підписи біля маркерів
         for pos, data, ylabel, title, color in axes_data:
             ax = fig.add_subplot(int(pos))
             ax.set_facecolor(AX_C)
@@ -772,11 +785,20 @@ class CableSettingsWindow(tk.Toplevel):
             ax.grid(True, color=GR_C, linewidth=0.5)
             for sp in ax.spines.values():
                 sp.set_color(GR_C)
-            # Мітка першої точки
-            ax.annotate(f'{data[0]:.4f}',
+            # Рухомий маркер i-підканалу + підпис значення (починає у позиції i=1)
+            mkr, = ax.plot([freq_mhz[0]], [data[0]],
+                           'o', color='#ffd54f', markersize=7, zorder=6,
+                           markeredgecolor='#0D1117', markeredgewidth=0.8)
+            self._i_markers.append(mkr)
+            annot = ax.annotate(
+                f'{data[0]:.4f}',
                 xy=(freq_mhz[0], data[0]),
+                xytext=(8, 6), textcoords='offset points',
                 color='#ffd54f', fontsize=7,
-                xytext=(freq_mhz[-1] * 0.04, data[0]))
+                bbox=dict(boxstyle='round,pad=0.2', fc='#0D1117', alpha=0.7),
+                arrowprops=dict(arrowstyle='->', color='#ffd54f', lw=0.8),
+                zorder=7)
+            self._i_annots.append(annot)
             # Для Re(Z1) — асимптота
             if pos == '313':
                 z_hf = float(z0[-1])
@@ -787,6 +809,7 @@ class CableSettingsWindow(tk.Toplevel):
                     color='#ffd54f', fontsize=7)
 
         self._fig_cable = fig
+        self._i_freq_mhz_arr = freq_mhz          # зберігаємо для _on_i_change
         cv = FigureCanvasTkAgg(fig, master=self._chart_frame)
         cv.draw()
         cv.get_tk_widget().pack(fill='both', expand=True)
